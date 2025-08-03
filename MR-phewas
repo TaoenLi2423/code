@@ -1,0 +1,78 @@
+# Set working directory and load packages
+library(TwoSampleMR)
+library(dplyr)
+
+setwd("E:/path/to/your/directory")
+
+# Load exposure data and filter for target genes
+exposure_data <- read.csv("exposure.csv", header = TRUE) 
+target_genes <- c("MMP24", "GPR17", "GPS1", "PROC", "GSTM1", "KLC3")
+exposure_dat <- exposure_data %>% filter(exposure %in% target_genes)
+
+# Load outcome phenotypes
+ukb_data <- read.csv("1431_ukb_phenotype", header = TRUE)
+
+# Custom MR function with proportion of variance explained
+mr_modified <- function(dat, prop_var_explained = TRUE) {
+  mr_res <- mr(dat)
+  
+  if(prop_var_explained) {
+    pve <- dat %>% 
+      group_by(id.exposure) %>% 
+      summarise(
+        pve = sum(beta.exposure^2 / (beta.exposure^2 + samplesize.exposure * se.exposure^2)),
+        .groups = 'drop'
+      )
+    mr_res <- left_join(mr_res, pve, by = "id.exposure")
+  }
+  return(mr_res)
+}
+
+# Process each outcome phenotype
+for(i in seq_len(nrow(ukb_data))) {
+  outcome_id <- ukb_data$ID[i]
+  outcome_name <- ukb_data$Phenotype[i]
+  
+  message("\nProcessing: ", outcome_name, " (", outcome_id, ")")
+  
+  tryCatch({
+    # Extract and harmonize data
+    outcome_data <- extract_outcome_data(exposure_dat$SNP, outcome_id)
+    if(is.null(outcome_data) next
+    
+    harmonised_data <- harmonise_data(exposure_dat, outcome_data)
+    if(nrow(harmonised_data) == 0) next
+    
+    # Perform MR analyses
+    mr_results <- mr_modified(harmonised_data)
+    mr_heterogeneity <- mr_heterogeneity(harmonised_data)
+    mr_pleiotropy <- mr_pleiotropy_test(harmonised_data)
+    
+    # Save results
+    safe_name <- gsub("[^[:alnum:]]", "_", outcome_name)
+    prefix <- paste0("MRresults_", safe_name, "_", outcome_id)
+    
+    write.csv(mr_results, paste0(prefix, "_MR.csv"), row.names = FALSE)
+    write.csv(mr_heterogeneity, paste0(prefix, "_heterogeneity.csv"), row.names = FALSE)
+    write.csv(mr_pleiotropy, paste0(prefix, "_pleiotropy.csv"), row.names = FALSE)
+    
+    message("Successfully processed: ", outcome_id)
+    
+  }, error = function(e) {
+    message("Error processing ", outcome_id, ": ", e$message)
+  })
+}
+
+# Combine all MR results
+mr_files <- list.files(pattern = "_MR\\.csv$", full.names = TRUE)
+
+if(length(mr_files) > 0) {
+  combined_data <- bind_rows(lapply(mr_files, function(x) {
+    read.csv(x) %>% mutate(source_file = basename(x))
+  }))
+  
+  write.csv(combined_data, "combined_MR_results.csv", row.names = FALSE)
+  message("Successfully combined ", length(mr_files), " files")
+} else {
+  message("No MR results files found")
+}
