@@ -1,0 +1,69 @@
+setwd("")
+library(VariantAnnotation)
+library(gwasglue)
+library(TwoSampleMR)
+library(dplyr)
+
+# Read and process data
+exposure_dat <- read_exposure_data(
+  filename = "met.exposure.F.csv",
+  sep = ",",
+  snp_col = "SNP",
+  beta_col = "beta.exposure",
+  se_col = "se.exposure",
+  pval_col = "pval.exposure",
+  effect_allele_col = "effect_allele.exposure",
+  other_allele_col = "other_allele.exposure",
+  eaf_col = "eaf.exposure",
+  id_col = "id.exposure",
+  phenotype_col = "exposure",
+  samplesize_col = "samplesize.exposure",
+  chr_col = "chr.exposure",
+  pos_col = "pos.exposure",
+  clump = FALSE
+)
+
+outcomeData <- read_outcome_data(
+  snps = exposure_dat$SNP,
+  filename = "finngen_R11_C3_PROSTATE_EXALLC.gz",
+  sep = "\t",
+  snp_col = "rsids",
+  beta_col = "beta",
+  se_col = "sebeta",
+  effect_allele_col = "alt",
+  other_allele_col = "ref",
+  pval_col = "pval",
+  eaf_col = "af_alt"
+)
+
+write.csv(outcomeData, "outcome.csv", row.names = FALSE)
+
+# Harmonize and analyze
+harmonised_data <- harmonise_data(exposure_dat, outcomeData)
+
+mr_modified <- function(dat, prop_var_explained = TRUE) {
+  mr_res <- mr(dat)
+  if (prop_var_explained) {
+    pve <- dat %>% 
+      group_by(id.exposure) %>% 
+      summarise(pve = sum((beta.exposure^2)/(beta.exposure^2 + samplesize.exposure*se.exposure^2)))
+    mr_res <- left_join(mr_res, pve, by = "id.exposure")
+  }
+  return(mr_res)
+}
+
+mr_results <- mr_modified(harmonised_data)
+mr_heterogeneity <- mr_heterogeneity(harmonised_data)
+mr_pleiotropy <- mr_pleiotropy_test(harmonised_data)
+
+# Save results
+write.csv(mr_results, "MRres.csv", row.names = FALSE)
+write.csv(mr_heterogeneity, "mr_heterogeneity.csv", row.names = FALSE)
+write.csv(mr_pleiotropy, "mr_pleiotropy.csv", row.names = FALSE)
+
+# Filter significant results
+significant_results <- mr_results %>% 
+  filter(pval < 0.05, method %in% c("Wald ratio", "Inverse variance weighted")) %>% 
+  left_join(exposure_dat, by = "id.exposure")
+
+write.csv(significant_results, "significant_results.csv", row.names = FALSE)
