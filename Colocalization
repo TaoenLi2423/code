@@ -1,0 +1,105 @@
+library(dplyr)
+library(data.table)
+library(coloc)
+library(VariantAnnotation)
+library(gwasglue)
+library(locuscomparer)
+
+# Parameters
+PPH4_THRESHOLD <- 0.75
+OUTCOME_FILE <- "finngen_R11_C3_PROSTATE_EXALLC.gz"
+FINN_ANNOTATION <- "R11_manifest.xls"
+DRUG_FILE <- "drug.IEUid.txt"
+WORKING_DIR <- "E:/path/to/your/directory"
+setwd(WORKING_DIR)
+
+# Process eQTL data
+vcf_data <- readVcf("eqtl-a-ENSG00000170145.vcf.gz")
+eqtl_data <- gwasvcf_to_TwoSampleMR(vcf_data, type="exposure") %>%
+  select(SNP, chr.exposure, pos.exposure, effect_allele.exposure, 
+         other_allele.exposure, eaf.exposure, beta.exposure,
+         se.exposure, pval.exposure, samplesize.exposure) %>%
+  rename(chrom = chr.exposure, Pos = pos.exposure, effect_allele = effect_allele.exposure,
+         other_allele = other_allele.exposure, MAF = eaf.exposure, beta = beta.exposure,
+         se = se.exposure, P = pval.exposure, samplesize = samplesize.exposure) %>%
+  mutate(varbeta = se^2, z = beta/se) %>%
+  distinct(SNP, .keep_all = TRUE)
+
+# Filter eQTL region
+GENE_REGION <- list(chr=11, start=111473173-1e5, end=111601579+1e5)
+LEAD_POS <- eqtl_data %>% 
+  filter(chrom == GENE_REGION$chr, between(Pos, GENE_REGION$start, GENE_REGION$end)) %>%
+  arrange(P) %>% 
+  pull(Pos) %>% 
+  first()
+
+QTL_DATA <- eqtl_data %>%
+  filter(between(Pos, LEAD_POS-5e4, LEAD_POS+5e4)) %>%
+  na.omit()
+
+# Process GWAS data
+gwas_raw <- fread(OUTCOME_FILE)
+finn_meta <- fread(FINN_ANNOTATION)
+trait_info <- finn_meta[grepl(OUTCOME_FILE, finn_meta$url),]
+
+GWAS_DATA <- gwas_raw %>%
+  select(rsids, `#chrom`, pos, alt, ref, af_alt, beta, sebeta, pval) %>%
+  rename(SNP = rsids, chrom = `#chrom`, effect_allele = alt, other_allele = ref,
+         eaf = af_alt, se = sebeta, P = pval) %>%
+  mutate(samplesize = trait_info$num_cases + trait_info$num_controls,
+         number_cases = trait_info$num_cases,
+         varbeta = se^2,
+         MAF = ifelse(eaf < 0.5, eaf, 1-eaf),
+         s = number_cases/samplesize,
+         z = beta/se) %>%
+  distinct(SNP, .keep_all = TRUE) %>%
+  na.omit()
+
+# Colocalization analysis
+shared_snps <- intersect(QTL_DATA$SNP, GWAS_DATA$SNP)
+QTL_FILTERED <- QTL_DATA %>% filter(SNP %in% shared_snps) %>% arrange(SNP) %>% na.omit()
+GWAS_FILTERED <- GWAS_DATA %>% filter(SNP %in% shared_snps) %>% arrange(SNP) %>% na.omit()
+
+coloc_input <- list(
+  eqtl = list(
+    snp = QTL_FILTERED$SNP,
+    beta = QTL_FILTERED$beta,
+    varbeta = QTL_FILTERED$varbeta,
+    N = QTL_FILTERED$samplesize,
+    MAF = QTL_FILTERED$MAF,
+    z = QTL_FILTERED$z,
+    pvalues = QTL_FILTERED$P,
+    type = "quant"
+  ),
+  gwas = list(
+    snp = GWAS_FILTERED$SNP,
+    beta = GWAS_FILTERED$beta,
+    varbeta = GWAS_FILTERED$varbeta,
+    N = GWAS_FILTERED$samplesize,
+    MAF = GWAS_FILTERED$MAF,
+    z = GWAS_FILTERED$z,
+    pvalues = GWAS_FILTERED$P,
+    type = "cc",
+    s = GWAS_FILTERED$s
+  )
+)
+
+coloc_result <- coloc.abf(coloc_input$eqtl, coloc_input$gwas)
+
+# Locus comparison plot
+plot_data <- list(
+  gwas = GWAS_FILTERED %>% select(SNP, P) %>% rename(rsid = SNP, pval = P),
+  eqtl = QTL_FILTERED %>% select(SNP, P) %>% rename(rsid = SNP, pval = P)
+)
+
+locus_plot <- locuscompare(
+  in_fn1 = plot_data$gwas,
+  in_fn2 = plot_data$eqtl,
+  title1 = 'PCa_GWAS',
+  title2 = 'SIK2_eQTL'
+)
+
+# Save outputs
+tiff("SIK2_locuscompare_plot.tiff", width = 8, height = 8, units = "in", res = 300)
+print(locus_plot)
+dev.off()
