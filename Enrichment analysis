@@ -1,0 +1,115 @@
+# Load required packages
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ggplot2)
+library(circlize)
+library(RColorBrewer)
+library(dplyr)
+library(ComplexHeatmap)
+library(viridis)
+
+# Set analysis parameters
+pvalue_filter <- 0.05      # p-value cutoff
+adj_pval_filter <- 0.1     # Adjusted p-value cutoff
+color_selection <- ifelse(adj_pval_filter > 0.05, "pvalue", "p.adjust")
+
+# ----------------------------
+# GO Enrichment Analysis
+# ----------------------------
+
+setwd("E:/path/to/your/GO_directory")
+results <- read.csv("sig.MRresult.csv", header=TRUE, sep=",", check.names=FALSE)
+
+# Convert gene symbols to Entrez IDs
+genes <- unique(results[,"exposure"])
+entrez_ids <- mget(genes, org.Hs.egSYMBOL2EG, ifnotfound=NA)
+entrez_ids <- as.character(entrez_ids)
+gene_list <- results$entrezID[!is.na(results$entrezID)]
+
+# Perform GO enrichment
+go_enrich <- enrichGO(gene = gene_list,
+                     OrgDb = org.Hs.eg.db,
+                     pvalueCutoff = 1,
+                     qvalueCutoff = 1,
+                     ont = "all",
+                     readable = TRUE)
+
+go_results <- as.data.frame(go_enrich) %>%
+  filter(pvalue < pvalue_filter & p.adjust < adj_pval_filter)
+
+# Visualize top GO terms
+top_go <- go_results %>%
+  group_by(ONTOLOGY) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  mutate(log_padj = -log10(p.adjust),
+         Description = str_wrap(Description, width = 40))
+
+ggplot(top_go, aes(x = reorder(Description, Count), y = Count, fill = log_padj)) +
+  geom_col(width = 0.8, color = "black", size = 0.3) +
+  coord_flip() +
+  scale_fill_viridis(name = "-log10(Adj p-value)", option = "plasma", direction = -1) +
+  labs(x = NULL, y = "Gene Count", 
+       title = "Top 10 GO Terms by Ontology",
+       subtitle = "Color indicates statistical significance") +
+  theme_minimal(base_size = 12) +
+  facet_grid(ONTOLOGY ~ ., scales = "free_y", space = "free") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray50"),
+        panel.grid.major.y = element_blank())
+
+ggsave("GO_enrichment.png", width = 10, height = 10, dpi = 300)
+
+# ----------------------------
+# KEGG Enrichment Analysis
+# ----------------------------
+
+setwd("E:/path/to/your/KEGG_directory")
+results <- read.csv("sig.MRresult_BCa.csv", header=TRUE, sep=",", check.names=FALSE)
+
+# Convert gene symbols to Entrez IDs
+genes <- unique(results[,"exposure"])
+entrez_ids <- mget(genes, org.Hs.egSYMBOL2EG, ifnotfound=NA)
+entrez_ids <- entrez_ids[!is.na(entrez_ids)]
+gene_list <- as.character(entrez_ids)
+
+# Perform KEGG enrichment
+kegg_enrich <- enrichKEGG(gene = gene_list,
+                         organism = "hsa",
+                         pvalueCutoff = 1,
+                         qvalueCutoff = 1) %>%
+  setReadable(OrgDb = "org.Hs.eg.db", keyType = "ENTREZID")
+
+kegg_results <- as.data.frame(kegg_enrich) %>%
+  mutate(Description = gsub(" - Homo sapiens \\(human\\)", "", Description)) %>%
+  filter(category != "Human Diseases",
+         pvalue < pvalue_filter,
+         p.adjust < adj_pval_filter)
+
+# Create chord diagram for top KEGG pathways
+top_kegg <- kegg_results %>%
+  arrange(desc(Count)) %>%
+  head(10)
+
+genes_in_pathways <- unique(unlist(strsplit(top_kegg$geneID, "/")))
+m <- matrix(0, nrow = nrow(top_kegg), ncol = length(genes_in_pathways),
+            dimnames = list(top_kegg$Description, genes_in_pathways))
+
+for(i in 1:nrow(top_kegg)) {
+  pathway_genes <- strsplit(top_kegg$geneID[i], "/")[[1]]
+  m[i, pathway_genes] <- top_kegg$Count[i]
+}
+
+# Set color scheme
+pathway_colors <- brewer.pal(nrow(m), "Set3")
+gene_colors <- colorRampPalette(c("#F0F0F0","#636363"))(ncol(m))
+grid_colors <- c(pathway_colors, gene_colors)
+names(grid_colors) <- c(rownames(m), colnames(m))
+
+# Create chord diagram
+circos.par(gap.after = c(rep(5, nrow(m)-1), 15, rep(1, ncol(m)-1), 15))
+chordDiagram(m, grid.col = grid_colors, transparency = 0.7,
+            directional = 1, link.arr.length = 0.15)
+circos.clear()
