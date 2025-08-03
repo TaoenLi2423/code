@@ -1,0 +1,185 @@
+# Load required packages
+library(data.table)
+library(foreach)
+library(TwoSampleMR)
+library(ggplot2)
+
+# ----------------------------
+# Step 1: Split mQTL data by CpG sites
+# ----------------------------
+setwd("G:/mQTL/step1")
+mqtl_data <- fread("GoDMCmQTL.txt")
+cpg_list <- fread("C3cg.txt", header = FALSE)[[1]]
+
+foreach(cpg = cpg_list, .errorhandling = "pass") %do% {
+  mqtl_data[cpg == cpg] %>% 
+    fwrite(paste0(cpg, ".txt"), sep = "\t", quote = FALSE)
+}
+
+# ----------------------------
+# Step 2: Clump significant mQTLs
+# ----------------------------
+setwd("G:/mQTL/step2")
+source_files <- list.files(pattern = "*.R$", full.names = TRUE)
+sapply(source_files, source)
+
+foreach(cpg = cpg_list, .errorhandling = "pass") %do% {
+  # Read and filter significant mQTLs
+  mqtl_sig <- fread(paste0(cpg, ".txt"))[pval < 5e-8]
+  
+  # Prepare data for clumping
+  clump_input <- mqtl_sig[, .(rsid = rsids2, pval)][rsid != ""]
+  
+  # Perform LD clumping
+  clumped <- ld_clump_local(
+    dat = clump_input,
+    clump_kb = 10000,
+    clump_r2 = 0.1,
+    clump_p = 1,
+    bfile = "/path/to/plink_reference",
+    plink_bin = "/opt/plink1.9/plink"
+  )
+  
+  # Save clumped results
+  mqtl_sig[rsids2 %in% clumped$rsid] %>% 
+    fwrite(paste0("clump/", cpg, "_clump.txt"), sep = "\t", quote = FALSE)
+}
+
+# ----------------------------
+# Step 3: Mendelian Randomization Analysis
+# ----------------------------
+setwd("/path/to/working/directory")
+results <- data.table()
+
+foreach(cpg = cpg_list, .errorhandling = "pass") %do% {
+  # Read and format exposure data
+  exposure_dat <- read_exposure_data(
+    filename = paste0("clump/", cpg, "_clump.txt"),
+    sep = "\t",
+    snp_col = "rsids2",
+    beta_col = "beta_a1",
+    se_col = "se",
+    effect_allele_col = "allele1",
+    other_allele_col = "allele2",
+    eaf_col = "freq_a1",
+    pval_col = "pval",
+    samplesize_col = "samplesize"
+  )
+  
+  # Extract outcome data
+  outcome_dat <- read_outcome_data(
+    snps = exposure_dat$SNP,
+    filename = "finngen_R11_C3_PROSTATE_EXALLC.gz",
+    sep = "\t",
+    snp_col = "variant_id",
+    beta_col = "beta",
+    se_col = "standard_error",
+    effect_allele_col = "effect_allele",
+    other_allele_col = "other_allele",
+    eaf_col = "effect_allele_frequency",
+    pval_col = "p_value"
+  )
+  
+  # Harmonize data
+  harm_dat <- harmonise_data(exposure_dat, outcome_dat, action = 2)
+  
+  # Calculate instrument strength metrics
+  harm_dat[, R2 := (2 * beta.exposure^2 * eaf.exposure * (1 - eaf.exposure)) /
+             (2 * beta.exposure^2 * eaf.exposure * (1 - eaf.exposure) +
+              2 * samplesize.exposure * eaf.exposure * (1 - eaf.exposure) * se.exposure^2)]
+  harm_dat[, F_stat := (R2 * (samplesize.exposure - 2)) / (1 - R2)]
+  harm_dat <- harm_dat[F_stat > 10]
+  
+  # Perform MR analysis
+  mr_res <- mr(harm_dat) %>% generate_odds_ratios()
+  mr_res[, FDR := p.adjust(pval, method = "fdr", n = 7)]
+  
+  # Sensitivity analyses
+  pleiotropy <- mr_pleiotropy_test(harm_dat)
+  heterogeneity <- mr_heterogeneity(harm_dat)
+  single_snp <- mr_singlesnp(harm_dat) %>% generate_odds_ratios()
+  leaveoneout <- mr_leaveoneout(harm_dat)
+  presso <- run_mr_presso(harm_dat, NbDistribution = 1000)
+  
+  # Save results
+  output_dir <- paste0("mqtl_result/", cpg)
+  dir.create(output_dir, showWarnings = FALSE)
+  
+  fwrite(harm_dat, paste0(output_dir, "/harmonise.txt"), sep = "\t")
+  fwrite(mr_res[, 5:ncol(mr_res)], paste0(output_dir, "/OR.txt"), sep = "\t")
+  fwrite(pleiotropy, paste0(output_dir, "/pleiotropy.txt"), sep = "\t")
+  fwrite(heterogeneity, paste0(output_dir, "/heterogeneity.txt"), sep = "\t")
+  fwrite(single_snp, paste0(output_dir, "/singlesnpOR.txt"), sep = "\t")
+  capture.output(presso, paste0(output_dir, "/presso.txt"))
+  
+  # Generate plots
+  mr_scatter_plot(mr_res, harm_dat)[[1]] %>% 
+    ggsave(paste0(output_dir, "/scatter.pdf"), width = 8, height = 8)
+  
+  mr_forest_plot(single_snp)[[1]] %>% 
+    ggsave(paste0(output_dir, "/forest.pdf"), width = 8, height = 8)
+  
+  mr_leaveoneout_plot(leaveoneout)[[1]] %>% 
+    ggsave(paste0(output_dir, "/sensitivity-analysis.pdf"), width = 8, height = 8)
+  
+  mr_funnel_plot(single_snp)[[1]] %>% 
+    ggsave(paste0(output_dir, "/funnelplot.pdf"), width = 8, height = 8)
+  
+  # Compile summary results
+  results <- rbind(results, data.table(
+    id = cpg,
+    nsnp = mr_res$nsnp[3],
+    beta = mr_res$b[3],
+    se = mr_res$se[3],
+    pvalue = mr_res$pval[3],
+    or = mr_res$or[3],
+    or_lci95 = mr_res$or_lci95[3],
+    or_uci95 = mr_res$or_uci95[3],
+    FDR = mr_res$FDR[3],
+    Heter.Stat = heterogeneity$Q[2],
+    Heter.p = heterogeneity$Q_pval[2],
+    egger_intercept = pleiotropy$egger_intercept,
+    egger_intercept_se = pleiotropy$se,
+    egger_intercept_pval = pleiotropy$pval
+  ))
+}
+
+# Save final results
+fwrite(results, "mqtl_result.txt", sep = "\t", quote = FALSE)
+
+# Define input parameters
+beta_all <- 0.250306192893401
+b2 <- 0.0339402413043189
+se2 <- 0.0129790179558407
+b1 <- -1.096566823
+se1 <- 0.272324963898076
+
+# Calculate indirect (mediation) effect
+indirect_effect <- b1 * b2
+indirect_se <- sqrt((b1^2 * se2^2) + (b2^2 * se1^2))
+indirect_ci <- indirect_effect + c(-1.96, 1.96) * indirect_se
+mediation_result <- sprintf("%.3f (%.3f, %.3f)", 
+                          indirect_effect, indirect_ci[1], indirect_ci[2])
+
+# Calculate direct effect
+direct_effect <- beta_all - indirect_effect
+
+# Calculate proportion mediated
+prop_mediated <- indirect_effect / beta_all
+prop_ci <- indirect_ci / beta_all
+prop_result <- sprintf("%.1f%% (%.1f%%, %.1f%%)", 
+                      prop_mediated * 100, prop_ci[1] * 100, prop_ci[2] * 100)
+
+# Calculate p-value
+z_score <- indirect_effect / indirect_se
+p_value <- 2 * pnorm(abs(z_score), lower.tail = FALSE)
+
+# Return results as a list
+mediation_analysis <- list(
+  indirect_effect = mediation_result,
+  direct_effect = direct_effect,
+  proportion_mediated = prop_result,
+  p_value = p_value
+)
+
+mediation_analysis
