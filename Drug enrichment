@@ -1,0 +1,43 @@
+# Load required packages
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Set analysis parameters
+pval_cutoff <- 0.05      # p-value cutoff
+adj_pval_cutoff <- 0.05  # Adjusted p-value cutoff
+color_metric <- ifelse(adj_pval_cutoff > 0.05, "pvalue", "p.adjust")
+
+# Set working directory and file paths
+setwd("C:/path/to/your/directory")
+drug_db_file <- "DSigDB_All_detailed.txt"
+mr_results_file <- "sig.MRresult.csv"
+
+# Read and process MR results
+mr_results <- read.csv(mr_results_file, header = TRUE)
+gene_symbols <- unique(mr_results[,"exposure"])
+
+# Convert gene symbols to Entrez IDs
+entrez_ids <- mget(gene_symbols, org.Hs.egSYMBOL2EG, ifnotfound = NA)
+entrez_ids <- entrez_ids[!is.na(entrez_ids)]
+gene_list <- as.character(entrez_ids)
+
+# Read drug database
+drug_db <- read.table(drug_db_file, header = TRUE, sep = "\t", 
+                     quote = "", comment.char = "")[,1:2]
+
+# Perform drug enrichment analysis
+drug_enrich <- enricher(
+  gene = gene_list,
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  minGSSize = 10,
+  maxGSSize = 500,
+  TERM2GENE = drug_db
+)
+
+# Filter and save significant results
+significant_drugs <- as.data.frame(drug_enrich) %>%
+  filter(pvalue < pval_cutoff, p.adjust < adj_pval_cutoff)
+
+write.table(significant_drugs, "DRUG.enrich.xls", 
+            sep = "\t", quote = FALSE, row.names = FALSE)
